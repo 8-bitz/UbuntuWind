@@ -1,19 +1,31 @@
 # install-docker-prefect-windmill.sh
 
 Provisions a single Ubuntu Server (ARM64) host to run **Docker**, **Prefect**,
-and **Windmill** — Prefect and Windmill both fully containerized via
-docker-compose, so both tools follow the same operational pattern.
+**Windmill**, and **Caddy** (reverse proxy) — all three apps fully
+containerized via docker-compose, accessible over the network via HTTPS.
 
 ## What it installs
 
-| Component | How it runs | Location |
-|---|---|---|
-| Docker Engine | native (apt, official Docker repo) | system-wide |
-| Prefect (server + worker + Postgres) | docker-compose | `/opt/prefect` |
-| Windmill (full stack + bundled Postgres) | docker-compose | `/opt/windmill` |
+| Component | How it runs | Location | Network exposure |
+|---|---|---|---|
+| Docker Engine | native (apt, official Docker repo) | system-wide | — |
+| Prefect (server + worker + Postgres) | docker-compose | `/opt/prefect` | 127.0.0.1 only |
+| Windmill (full stack + bundled Postgres) | docker-compose | `/opt/windmill` | 127.0.0.1 only |
+| Caddy (TLS reverse proxy) | docker-compose, host networking | `/opt/caddy` | network-reachable |
 
-Prefect and Windmill each run on their own isolated Docker network — neither
-stack can reach the other's database.
+Prefect and Windmill are **never directly reachable from the network** — only
+Caddy is exposed, and it proxies HTTPS traffic to each app's loopback-bound
+port. Prefect and Windmill also each run on their own isolated Docker
+network, so neither can reach the other's database.
+
+## Why Caddy, and why "local CA" TLS
+
+Since this is accessed from other machines on your network (not the public
+internet), there's no domain to get a Let's Encrypt certificate for. Caddy
+generates its own local root CA and uses it to issue certs for both apps
+automatically (`tls internal`) — traffic is genuinely encrypted, but browsers
+will flag it as untrusted until you import that root CA once per client
+machine (see below).
 
 ## Usage
 
@@ -21,9 +33,9 @@ stack can reach the other's database.
 sudo ./install-docker-prefect-windmill.sh
 ```
 
-Safe to re-run: it tears down and removes any prior Docker/Prefect/Windmill
+Safe to re-run: it tears down and removes any prior Docker/Prefect/Windmill/Caddy
 install first (including old volumes — re-running intentionally means data
-loss for both tools, by design).
+loss for all three, by design).
 
 ## After it runs
 
@@ -31,39 +43,48 @@ loss for both tools, by design).
    ```bash
    newgrp docker
    ```
-   (A script can't change the group membership of the shell that invoked it —
-   that's a Linux limitation, not something this script skipped. `newgrp`
-   gets you there immediately instead of logging out.)
 
-2. **Log into Windmill and change the default password immediately.**
-   URL: `http://<host>:8000` — default is `admin@windmill.dev` / `changeme`.
+2. **Trust Caddy's root CA on any machine you'll browse from** (one-time per machine):
+   - Copy `/opt/caddy/root-ca.crt` off the server (scp, USB, however you move files).
+   - Import it as a trusted root:
+     - **Windows:** double-click the `.crt` → Install Certificate → Local Machine →
+       "Trusted Root Certification Authorities"
+     - **macOS:** open in Keychain Access → System keychain → set "Always Trust"
+     - **Firefox:** Settings → Privacy & Security → Certificates → View Certificates →
+       Authorities → Import
+   - After this, both URLs below show as a normal trusted HTTPS padlock.
 
-3. **Access Prefect's UI via SSH tunnel** (it's bound to `127.0.0.1` only,
-   by design, until you add a reverse proxy):
+3. **Access the apps from anywhere on the network:**
+   - Prefect: `https://<host-ip>:4443`
+   - Windmill: `https://<host-ip>:8443`
+   (The script prints the actual detected IP in its summary — use that.)
+
+4. **Log into Windmill and change the default password immediately.**
+   Default is `admin@windmill.dev` / `changeme`.
+
+5. **No subnet restriction needed by design.** This deployment is internal-only
+   (multiple subnets/VPN, no internet exposure), so UFW intentionally allows
+   the two Caddy ports from any source — TLS is the control protecting
+   credentials/session data in transit, and that doesn't depend on which
+   internal subnet a request comes from. If this host's reachability ever
+   changes (e.g. it becomes reachable beyond your internal network), revisit
+   this and narrow to specific source ranges:
    ```bash
-   ssh -L 4200:127.0.0.1:4200 <user>@<host>
-   ```
-   then browse `http://127.0.0.1:4200`.
-
-4. **Put both behind a reverse proxy with TLS** (Caddy or nginx) before this
-   box is relied on for anything real — the script deliberately doesn't
-   automate this since it depends on your domain/DNS/cert setup.
-
-5. **Tighten the firewall** once the proxy exists:
-   ```bash
-   sudo ufw delete allow 4200/tcp
-   sudo ufw delete allow 8000/tcp
+   sudo ufw allow from <range> to any port 4443
+   sudo ufw allow from <range> to any port 8443
    ```
 
-6. **Back up the `.env` files and Postgres volumes** for both
-   `/opt/prefect` and `/opt/windmill` — losing either loses that tool's data.
+6. **Back up** the `.env` files for Prefect and Windmill, their Postgres
+   volumes, and `/opt/caddy/root-ca.crt`. If Caddy's own data volume is ever
+   lost, it generates a *new* root CA on next start — meaning you'd need to
+   re-trust it on every client machine again.
 
 ## Day-2 operations
 
-Same commands work for both tools, one directory swap apart:
+Same commands work for all three stacks, one directory swap apart:
 
 ```bash
-cd /opt/prefect   # or /opt/windmill
+cd /opt/prefect   # or /opt/windmill, or /opt/caddy
 docker compose pull && docker compose up -d   # update
 docker compose logs -f <service>               # tail logs
 docker compose down                            # stop (add -v to also wipe data)
@@ -73,24 +94,39 @@ docker compose down                            # stop (add -v to also wipe data)
 
 | File | Contents |
 |---|---|
-| `/opt/prefect/.env` | Generated Postgres password for Prefect's DB |
+| `/opt/prefect/.env` | Generated Postgres password, host IP, Caddy port used by the UI |
 | `/opt/windmill/.env` | Generated Postgres password + a Windmill CLI token |
+| `/opt/caddy/root-ca.crt` | Exported copy of Caddy's local CA — needed to trust the TLS certs |
 
-Both are `chmod 600`, root-owned, and never printed in full to the terminal.
+All `.env` files are `chmod 600`, root-owned, and never printed in full to the terminal.
 
 ## Security posture applied
 
 - Docker daemon: log rotation capped, `no-new-privileges`, inter-container
   communication disabled by default, `live-restore` on.
-- Every container in both stacks: `no-new-privileges:true`.
-- UFW: default-deny inbound; only SSH + the two app ports open (bootstrap
-  state — see step 5 above).
+- Every container in all stacks: `no-new-privileges:true`.
+- Prefect and Windmill bound to `127.0.0.1` only — Caddy is the sole entry point.
+- HTTPS via Caddy's local CA for both apps.
+- UFW: default-deny inbound; only SSH + Caddy's two HTTPS ports open, from
+  any source — deliberate for this internal-only, multi-subnet/VPN environment,
+  not a placeholder (see step 5 above).
 - fail2ban enabled for SSH.
-- Isolated Docker networks per stack.
+- Isolated Docker networks per stack (Prefect/Windmill can't reach each other's DB).
 
 ## What's intentionally NOT automated
 
-- TLS / reverse proxy setup — needs your domain and cert decisions.
+- A publicly-trusted certificate (Let's Encrypt) — not applicable without a
+  real domain; Caddy's local CA is the correct fit for network-internal access.
 - Changing Windmill's default superadmin password — must be done via the UI
   on first login.
-- Narrowing the firewall to specific source IPs/subnets.
+- Narrowing the firewall to specific source IPs/subnets — not applicable for
+  this deployment (internal-only, multiple subnets/VPN); revisit only if the
+  host's network reachability changes.
+
+## If the host's IP changes
+
+Prefect's UI is configured with the API URL baked in at install time
+(`PREFECT_UI_API_URL`), and Windmill's `BASE_URL` is similarly fixed. If this
+host later gets a different IP (e.g. DHCP reassignment), either give it a
+static IP/DNS name, or re-run the script and update `HOST_IP` in both `.env`
+files followed by `docker compose up -d` in each directory.
