@@ -38,7 +38,11 @@
 #     .env                 Generated Postgres credentials (mode 600, root)
 #   /opt/windmill/
 #     docker-compose.yml   Official Windmill stack (fetched from GitHub)
-#     .env                 Generated Postgres password + Windmill token (mode 600, root)
+#     .env                 Generated Postgres password + Windmill token + pinned
+#                           WM_IMAGE (mode 600, root) — WM_IMAGE is required by the
+#                           upstream compose file's image fields; without it,
+#                           `docker compose up` fails with "has neither an image
+#                           nor a build context specified".
 #   /opt/caddy/
 #     Caddyfile             Reverse proxy config for both apps
 #     docker-compose.yml    Caddy container definition (host networking)
@@ -383,6 +387,12 @@ curl -fsSL https://raw.githubusercontent.com/windmill-labs/windmill/main/docker-
 
 WM_DB_PASSWORD="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32)"
 WM_TOKEN="$(openssl rand -hex 32)"
+# The upstream compose file parameterizes every service's image via
+# ${WM_IMAGE} with no default — if it's unset/empty, `docker compose up`
+# fails with "has neither an image nor a build context specified". Pin the
+# community-edition image here (ghcr.io/windmill-labs/windmill-ee:main is the
+# enterprise equivalent, if you have an EE license).
+WM_IMAGE="ghcr.io/windmill-labs/windmill:main"
 
 cat > .env <<EOF
 # Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) — treat as a secret, not committed to git
@@ -392,6 +402,7 @@ MODE=standalone
 BASE_URL=https://${HOST_IP}:${CADDY_WINDMILL_PORT}
 RUST_LOG=info
 WM_TOKEN=${WM_TOKEN}
+WM_IMAGE=${WM_IMAGE}
 EOF
 chmod 600 .env
 
